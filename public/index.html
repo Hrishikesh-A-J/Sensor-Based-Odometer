@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Digital Odometer</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+ body{font-family:system-ui,sans-serif;margin:0;background:#f4f5f7;color:#111}
+ header{display:flex;justify-content:space-between;align-items:center;padding:12px 20px;background:#111;color:#fff}
+ .dot{display:inline-block;width:10px;height:10px;border-radius:50%;background:#999;margin-right:6px}
+ main{max-width:1100px;margin:auto;padding:16px;display:grid;gap:16px}
+ .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px}
+ .card,.panel{background:#fff;border-radius:10px;padding:14px;box-shadow:0 1px 3px #0002}
+ .card b{display:block;font-size:2rem;margin-top:4px}
+ .card span{color:#666;font-size:.85rem}
+ #map{height:380px;border-radius:8px}
+ button{padding:8px 14px;border:0;border-radius:6px;background:#2563eb;color:#fff;cursor:pointer;margin-right:6px}
+ button.alt{background:#555}
+ table{width:100%;border-collapse:collapse;font-size:.85rem}
+ td,th{padding:4px 8px;text-align:right;border-bottom:1px solid #eee} th:first-child,td:first-child{text-align:left}
+ .wrap{overflow-x:auto}
+</style></head><body>
+<header><div><b>Digital Odometer</b> · Trip <span id="tid">1</span></div><div><span class="dot" id="dot"></span><span id="status">waiting…</span></div></header>
+<main>
+ <div class="cards">
+  <div class="card"><span>Speed</span><b><span id="v">0.0</span> km/h</b></div>
+  <div class="card"><span>Trip distance</span><b><span id="trip">0.000</span> km</b></div>
+  <div class="card"><span>Total odometer</span><b><span id="total">0.000</span> km</b></div>
+ </div>
+ <div class="panel">
+  <button id="newTrip">Start new trip</button>
+  <button class="alt" id="share">Share this phone's location</button>
+  <a href="/api/log.csv"><button class="alt">Download CSV</button></a>
+ </div>
+ <div class="panel"><b>Speed during trip</b><canvas id="chart" height="90"></canvas></div>
+ <div class="panel"><b>Route</b><div id="map"></div></div>
+ <div class="panel"><b>Data log (latest 30)</b><div class="wrap"><table><thead><tr><th>Time</th><th>Speed km/h</th><th>Trip km</th><th>Total km</th></tr></thead><tbody id="rows"></tbody></table></div></div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+let key = localStorage.getItem('odoKey') || '';
+let needsKey = false;
+fetch('/api/config').then(r => r.json()).then(c => needsKey = c.needsKey);
+const getKey = () => { if (needsKey && !key) { key = prompt('Enter API key') || ''; localStorage.setItem('odoKey', key); } return key; };
+const post = (url, body) => fetch(url, { method:'POST', headers:{'Content-Type':'application/json','x-api-key':getKey()}, body: JSON.stringify(body||{}) })
+  .then(r => { if (r.status === 401) { key=''; localStorage.removeItem('odoKey'); alert('Wrong key'); } return r; });
+
+const map = L.map('map').setView([20.5, 78.9], 5);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OpenStreetMap' }).addTo(map);
+const line = L.polyline([], { color:'#2563eb', weight:4 }).addTo(map);
+let marker = null, firstFix = true;
+
+const chart = new Chart($('chart'), { type:'line',
+  data:{ labels:[], datasets:[{ label:'km/h', data:[], borderColor:'#2563eb', pointRadius:0, tension:.25 }] },
+  options:{ animation:false, scales:{ y:{ beginAtZero:true } } } });
+
+let rows = [], lastTs = 0;
+const t = ts => new Date(ts).toLocaleTimeString();
+
+function showLatest(p) {
+  lastTs = p.ts;
+  $('v').textContent = p.v.toFixed(1);
+  $('trip').textContent = (p.trip/1000).toFixed(3);
+  $('total').textContent = (p.total/1000).toFixed(3);
+}
+function renderTable() {
+  $('rows').innerHTML = rows.slice(-30).reverse().map(r =>
+    `<tr><td>${t(r.ts)}</td><td>${r.v.toFixed(1)}</td><td>${(r.trip/1000).toFixed(3)}</td><td>${(r.total/1000).toFixed(3)}</td></tr>`).join('');
+}
+function addPoint(p) {
+  rows.push(p); showLatest(p);
+  chart.data.labels.push(t(p.ts)); chart.data.datasets[0].data.push(p.v);
+  if (rows.length > 3600) { rows.shift(); chart.data.labels.shift(); chart.data.datasets[0].data.shift(); }
+  chart.update('none'); renderTable();
+}
+function addLoc(l) {
+  const ll = [l.lat, l.lon];
+  line.addLatLng(ll);
+  if (!marker) marker = L.circleMarker(ll, { radius:8, color:'#dc2626', fillOpacity:.9 }).addTo(map);
+  else marker.setLatLng(ll);
+  if (firstFix) { map.setView(ll, 16); firstFix = false; } else map.panTo(ll);
+}
+function loadSnapshot(s) {
+  $('tid').textContent = s.tripId;
+  rows = s.log;
+  chart.data.labels = rows.map(r => t(r.ts)); chart.data.datasets[0].data = rows.map(r => r.v);
+  chart.update('none'); renderTable();
+  if (s.latest) showLatest(s.latest);
+  line.setLatLngs(s.locs.map(l => [l.lat, l.lon])); firstFix = true;
+  if (marker) { map.removeLayer(marker); marker = null; }
+  if (s.locs.length) { s.locs.forEach(()=>{}); addLoc(s.locs[s.locs.length-1]); if (s.locs.length>1) map.fitBounds(line.getBounds(), {maxZoom:17}); }
+}
+
+const es = new EventSource('/api/stream');
+es.addEventListener('init', e => loadSnapshot(JSON.parse(e.data)));
+es.addEventListener('data', e => addPoint(JSON.parse(e.data)));
+es.addEventListener('loc',  e => addLoc(JSON.parse(e.data)));
+es.addEventListener('reset', e => loadSnapshot({ tripId: JSON.parse(e.data).tripId, log:[], locs:[], latest:null }));
+
+setInterval(() => {
+  const age = (Date.now() - lastTs) / 1000, on = lastTs && age < 5;
+  $('dot').style.background = on ? '#22c55e' : '#ef4444';
+  $('status').textContent = on ? 'ESP32 online' : (lastTs ? 'ESP32 offline' : 'waiting…');
+}, 1000);
+
+$('newTrip').onclick = () => { if (confirm('Start a new trip?')) post('/api/trip/reset'); };
+
+// Phone GPS -> server (open this page on your phone and tap the button)
+let watchId = null, lastSent = 0, wake = null;
+$('share').onclick = async () => {
+  if (watchId !== null) { navigator.geolocation.clearWatch(watchId); watchId = null; if (wake) wake.release(); $('share').textContent = "Share this phone's location"; return; }
+  if (!navigator.geolocation) return alert('No geolocation on this device');
+  getKey();
+  try { wake = await navigator.wakeLock.request('screen'); } catch (_) {}
+  watchId = navigator.geolocation.watchPosition(pos => {
+    if (Date.now() - lastSent < 2000) return; lastSent = Date.now();
+    post('/api/location', { lat: pos.coords.latitude, lon: pos.coords.longitude, acc: pos.coords.accuracy });
+  }, err => alert(err.message), { enableHighAccuracy: true, maximumAge: 0 });
+  $('share').textContent = 'Stop sharing location';
+};
+</script></body></html>
